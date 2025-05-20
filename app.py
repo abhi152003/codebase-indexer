@@ -58,7 +58,7 @@ app = FastAPI(title='Codebase Evaluation API')
 # Add CORS middleware to allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost", "http://0.0.0.0:3000", "https://speedrunstylus.com", "http://speedrunstylus.com"],
+    allow_origins=["http://localhost:3000", "http://localhost", "http://0.0.0.0:3000", "https://www.speedrunstylus.com", "http://www.speedrunstylus.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
