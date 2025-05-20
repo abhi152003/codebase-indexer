@@ -393,7 +393,7 @@ async def begin_processing(request: BackgroundProcessRequest, background_tasks: 
     return {
         'processing_id': processing_id,
         'status': 'submitted',
-        'estimatedTimeRemaining': 300  # Initial estimate of 5 minutes
+        'estimatedTimeRemaining': 600  # Initial estimate of 10 minutes
     }
 
 @app.get('/processing-status/{processing_id}')
