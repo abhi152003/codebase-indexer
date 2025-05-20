@@ -55,7 +55,7 @@ app = FastAPI(title='Codebase Evaluation API')
 # Add CORS middleware to allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost", "http://0.0.0.0:3000"],  # List of allowed origins
+    allow_origins=["http://localhost:3000", "http://localhost", "http://0.0.0.0:3000", "https://speedrunstylus.com", "http://speedrunstylus.com"],  # Added your domain
     allow_credentials=True,
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
@@ -65,6 +65,9 @@ app.add_middleware(
 MODEL_NAME = 'huggingface/CodeBERTa-small-v1'
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(MODEL_NAME)
+
+# Request timeout in seconds
+REQUEST_TIMEOUT = 300  # 5 minutes timeout for long-running operations
 
 class RepoRequest(BaseModel):
     repo_url: str
@@ -151,34 +154,68 @@ async def evaluate_repo(request: RepoRequest):
     repo_dir = f'repos/{repo_name}'
     
     try:
-        # Clone the repository
-        await clone_repo(repo_url, repo_dir)
+        # Set a timeout for the entire operation
+        process_complete = False
         
-        # Get code files from specified folders or entire repo
-        code_files = get_code_files(repo_dir, request.folders)
-        if not code_files:
+        async def process_repo_with_timeout():
+            nonlocal process_complete
+            try:
+                # Clone the repository
+                await clone_repo(repo_url, repo_dir)
+                
+                # Get code files from specified folders or entire repo
+                code_files = get_code_files(repo_dir, request.folders)
+                if not code_files:
+                    delete_repo(repo_dir)
+                    raise HTTPException(status_code=404, detail='No code files found in the specified folders or repository.')
+                
+                # Process files in batches to improve performance
+                BATCH_SIZE = 5  # Process 5 files at a time
+                results = []
+                
+                for i in range(0, len(code_files), BATCH_SIZE):
+                    batch = code_files[i:i+BATCH_SIZE]
+                    batch_tasks = [process_file(file_path, repo_url) for file_path in batch]
+                    batch_results = await asyncio.gather(*batch_tasks)
+                    results.extend(batch_results)
+                    # Log progress to monitor performance
+                    logger.info(f'Processed batch {i//BATCH_SIZE + 1}/{(len(code_files) + BATCH_SIZE - 1)//BATCH_SIZE}')
+                
+                success_count = sum(1 for result in results if result['status'] == 'success')
+                error_count = len(results) - success_count
+                errors = [result for result in results if result['status'] == 'error']
+                
+                # Delete the repository after processing if there are successful embeddings
+                if success_count > 0:
+                    delete_repo(repo_dir)
+                    
+                process_complete = True
+                return {
+                    'message': f'Processed {len(code_files)} files. {success_count} successful, {error_count} failed.',
+                    'processed_files': len(code_files),
+                    'success_count': success_count,
+                    'error_count': error_count,
+                    'errors': errors
+                }
+            except Exception as e:
+                delete_repo(repo_dir)
+                logger.error(f'Error in process_repo_with_timeout: {str(e)}')
+                raise e
+        
+        # Run the processing with a timeout
+        try:
+            result = await asyncio.wait_for(process_repo_with_timeout(), timeout=REQUEST_TIMEOUT)
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f'Repository processing timed out after {REQUEST_TIMEOUT} seconds')
             delete_repo(repo_dir)
-            raise HTTPException(status_code=404, detail='No code files found in the specified folders or repository.')
-        
-        # Process files to generate and store embeddings
-        tasks = [process_file(file_path, repo_url) for file_path in code_files]
-        results = await asyncio.gather(*tasks)
-        
-        success_count = sum(1 for result in results if result['status'] == 'success')
-        error_count = len(results) - success_count
-        errors = [result for result in results if result['status'] == 'error']
-        
-        # Delete the repository after processing if there are successful embeddings
-        if success_count > 0:
-            delete_repo(repo_dir)
-        
-        return {
-            'message': f'Processed {len(code_files)} files. {success_count} successful, {error_count} failed.',
-            'processed_files': len(code_files),
-            'success_count': success_count,
-            'error_count': error_count,
-            'errors': errors
-        }
+            raise HTTPException(status_code=504, 
+                detail=f'Repository processing timed out after {REQUEST_TIMEOUT} seconds. The repository may be too large or complex.')
+        finally:
+            # Clean up if not already done
+            if not process_complete:
+                delete_repo(repo_dir)
+                
     except HTTPException as he:
         delete_repo(repo_dir)
         raise he
@@ -315,4 +352,4 @@ async def fetch_file_from_github(repo_url: str, file_path: str) -> str:
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='127.0.0.1', port=8000) 
+    uvicorn.run(app, host='127.0.0.1', port=8001) 
