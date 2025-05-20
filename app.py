@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware  # Import CORS middleware
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 import git
@@ -7,7 +7,7 @@ import logging
 import asyncio
 import nest_asyncio
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 import torch
@@ -15,6 +15,9 @@ from pinecone import Pinecone, ServerlessSpec
 from dotenv import load_dotenv
 import shutil
 import requests
+import uuid
+import time
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -55,10 +58,10 @@ app = FastAPI(title='Codebase Evaluation API')
 # Add CORS middleware to allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost", "http://0.0.0.0:3000", "https://speedrunstylus.com", "http://speedrunstylus.com"],  # Added your domain
+    allow_origins=["http://localhost:3000", "http://localhost", "http://0.0.0.0:3000", "https://speedrunstylus.com", "http://speedrunstylus.com"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Model and tokenizer for CodeBERTa
@@ -66,11 +69,17 @@ MODEL_NAME = 'huggingface/CodeBERTa-small-v1'
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(MODEL_NAME)
 
-# Request timeout in seconds
-REQUEST_TIMEOUT = 300  # 5 minutes timeout for long-running operations
+# In-memory storage for tracking processing tasks
+processing_tasks = {}
 
 class RepoRequest(BaseModel):
     repo_url: str
+    folders: List[str] = []
+
+class BackgroundProcessRequest(BaseModel):
+    repo_url: str
+    description: str
+    challenge_name: str
     folders: List[str] = []
 
 class QueryRequest(BaseModel):
@@ -126,8 +135,6 @@ async def process_file(file_path: str, repo_url: str) -> Dict:
             content = f.read()
         embedding = generate_embedding(content)
         file_id = f'{repo_url}/{file_path}'
-        print("Embedding generated", embedding)
-        print("Upserting...", embedding.tolist())
         index.upsert([(file_id, embedding.tolist(), {'file_path': file_path, 'repo_url': repo_url})])
         logger.info(f'Successfully processed and stored embedding for {file_path}')
         return {'file_path': file_path, 'status': 'success'}
@@ -146,113 +153,105 @@ def delete_repo(repo_dir: str) -> None:
     except Exception as e:
         logger.error(f'Error deleting repository {repo_dir}: {str(e)}')
 
-@app.post('/evaluate-repo')
-async def evaluate_repo(request: RepoRequest):
-    """Endpoint to evaluate a GitHub repository by cloning it and storing embeddings of code files."""
-    repo_url = request.repo_url
-    repo_name = repo_url.split('/')[-1].replace('.git', '')
-    repo_dir = f'repos/{repo_name}'
-    
+async def process_repo(processing_id: str, repo_url: str, description: str, challenge_name: str, folders: List[str]):
+    """Background processing task to evaluate a repository and generate a score."""
     try:
-        # Set a timeout for the entire operation
-        process_complete = False
+        # Update task status to processing
+        processing_tasks[processing_id]['status'] = 'processing'
+        processing_tasks[processing_id]['start_time'] = time.time()
         
-        async def process_repo_with_timeout():
-            nonlocal process_complete
-            try:
-                # Clone the repository
-                await clone_repo(repo_url, repo_dir)
-                
-                # Get code files from specified folders or entire repo
-                code_files = get_code_files(repo_dir, request.folders)
-                if not code_files:
-                    delete_repo(repo_dir)
-                    raise HTTPException(status_code=404, detail='No code files found in the specified folders or repository.')
-                
-                # Process files in batches to improve performance
-                BATCH_SIZE = 5  # Process 5 files at a time
-                results = []
-                
-                for i in range(0, len(code_files), BATCH_SIZE):
-                    batch = code_files[i:i+BATCH_SIZE]
-                    batch_tasks = [process_file(file_path, repo_url) for file_path in batch]
-                    batch_results = await asyncio.gather(*batch_tasks)
-                    results.extend(batch_results)
-                    # Log progress to monitor performance
-                    logger.info(f'Processed batch {i//BATCH_SIZE + 1}/{(len(code_files) + BATCH_SIZE - 1)//BATCH_SIZE}')
-                
-                success_count = sum(1 for result in results if result['status'] == 'success')
-                error_count = len(results) - success_count
-                errors = [result for result in results if result['status'] == 'error']
-                
-                # Delete the repository after processing if there are successful embeddings
-                if success_count > 0:
-                    delete_repo(repo_dir)
-                    
-                process_complete = True
-                return {
-                    'message': f'Processed {len(code_files)} files. {success_count} successful, {error_count} failed.',
-                    'processed_files': len(code_files),
-                    'success_count': success_count,
-                    'error_count': error_count,
-                    'errors': errors
-                }
-            except Exception as e:
-                delete_repo(repo_dir)
-                logger.error(f'Error in process_repo_with_timeout: {str(e)}')
-                raise e
+        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        repo_dir = f'repos/{repo_name}'
         
-        # Run the processing with a timeout
-        try:
-            result = await asyncio.wait_for(process_repo_with_timeout(), timeout=REQUEST_TIMEOUT)
-            return result
-        except asyncio.TimeoutError:
-            logger.error(f'Repository processing timed out after {REQUEST_TIMEOUT} seconds')
+        # Clone the repository
+        await clone_repo(repo_url, repo_dir)
+        
+        # Get code files from specified folders or entire repo
+        code_files = get_code_files(repo_dir, folders)
+        if not code_files:
+            processing_tasks[processing_id]['status'] = 'failed'
+            processing_tasks[processing_id]['error'] = 'No code files found in the specified folders or repository.'
             delete_repo(repo_dir)
-            raise HTTPException(status_code=504, 
-                detail=f'Repository processing timed out after {REQUEST_TIMEOUT} seconds. The repository may be too large or complex.')
-        finally:
-            # Clean up if not already done
-            if not process_complete:
-                delete_repo(repo_dir)
-                
-    except HTTPException as he:
+            return
+        
+        # Process files in batches to improve performance
+        BATCH_SIZE = 5  # Process 5 files at a time
+        results = []
+        
+        processing_tasks[processing_id]['total_files'] = len(code_files)
+        processing_tasks[processing_id]['processed_files'] = 0
+        
+        for i in range(0, len(code_files), BATCH_SIZE):
+            batch = code_files[i:i+BATCH_SIZE]
+            batch_tasks = [process_file(file_path, repo_url) for file_path in batch]
+            batch_results = await asyncio.gather(*batch_tasks)
+            results.extend(batch_results)
+            
+            # Update progress
+            processing_tasks[processing_id]['processed_files'] += len(batch)
+            
+            # Calculate estimated time remaining
+            elapsed_time = time.time() - processing_tasks[processing_id]['start_time']
+            files_processed = processing_tasks[processing_id]['processed_files']
+            if files_processed > 0:
+                time_per_file = elapsed_time / files_processed
+                remaining_files = len(code_files) - files_processed
+                est_time_remaining = time_per_file * remaining_files
+                processing_tasks[processing_id]['estimatedTimeRemaining'] = int(est_time_remaining)
+        
+        success_count = sum(1 for result in results if result['status'] == 'success')
+        error_count = len(results) - success_count
+        
+        # After embedding generation, query the code for review
+        if success_count > 0:
+            # Query codebase for evaluation
+            query_result = await query_codebase_for_evaluation(repo_url, description, challenge_name)
+            
+            # Extract score from response
+            score = extract_score_from_response(query_result.get('answer', ''))
+            
+            # Update task with result
+            processing_tasks[processing_id]['status'] = 'completed'
+            processing_tasks[processing_id]['result'] = {
+                'answer': query_result.get('answer', ''),
+                'score': score,
+                'relevant_files': query_result.get('relevant_files', [])
+            }
+        else:
+            processing_tasks[processing_id]['status'] = 'failed'
+            processing_tasks[processing_id]['error'] = 'Failed to process any files successfully.'
+        
+        # Delete the repository after processing
         delete_repo(repo_dir)
-        raise he
+        
     except Exception as e:
+        logger.error(f'Error in background processing: {str(e)}')
+        processing_tasks[processing_id]['status'] = 'failed'
+        processing_tasks[processing_id]['error'] = str(e)
         delete_repo(repo_dir)
-        logger.error(f'Unexpected error: {str(e)}')
-        raise HTTPException(status_code=500, detail=f'Unexpected error: {str(e)}')
 
-@app.post('/query-codebase')
-async def query_codebase(request: QueryRequest):
-    """Endpoint to query the codebase using gpt-4o-mini with context from Pinecone embeddings."""
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail='OpenAI API key not configured.')
-    
+async def query_codebase_for_evaluation(repo_url: str, description: str, challenge_name: str) -> Dict:
+    """Query the codebase using OpenAI with context from Pinecone embeddings."""
     try:
         # Generate embedding for the query
-        query_embedding = generate_embedding(request.query)
+        query = f"{description} - Evaluate this {challenge_name} solution for code quality, best practices, and potential improvements."
+        query_embedding = generate_embedding(query)
         
         # Query Pinecone for relevant code snippets
         query_result = index.query(
             vector=query_embedding.tolist(),
-            top_k=request.top_k,
+            top_k=2,
             include_metadata=True,
-            filter={'repo_url': request.repo_url}
+            filter={'repo_url': repo_url}
         )
-        
-        print("query_result", query_result)
         
         # Prepare context by fetching full content from GitHub
         context = []
         for match in query_result['matches']:
             file_path = match['metadata']['file_path']
-            full_content = await fetch_file_from_github(request.repo_url, file_path)
+            full_content = await fetch_file_from_github(repo_url, file_path)
             context.append(f'File: {file_path}\nContent:\n{full_content}\n')
         context_text = '\n\n'.join(context) if context else 'No relevant code snippets found.'
-        
-        print("context_text", context_text)
         
         # Prepare the prompt for OpenAI
         prompt = f"""You are an objective code evaluator reviewing a student's submitted challenge. Based on the provided code context and the student's description of their changes, evaluate the code and return a single numeric score between 0-100.
@@ -289,7 +288,7 @@ Your evaluation must consider these specific metrics with equal weight (25% each
 Code Context:
 {context_text}
 
-Student's description of changes: {request.query}
+Student's description of changes: {description}
 
 Your response must be ONLY a number between 0-100 representing the overall score. Do not include any explanations, comments, or additional text."""
         
@@ -310,13 +309,25 @@ Your response must be ONLY a number between 0-100 representing the overall score
         answer = response.json()['choices'][0]['message']['content']
         
         return {
-            'query': request.query,
+            'query': query,
             'answer': answer,
             'relevant_files': [match['metadata']['file_path'] for match in query_result['matches']]
         }
     except Exception as e:
         logger.error(f'Error querying codebase: {str(e)}')
-        raise HTTPException(status_code=500, detail=f'Error querying codebase: {str(e)}')
+        return {'error': str(e)}
+
+def extract_score_from_response(answer: str) -> Optional[int]:
+    """Extract a score from the model's response."""
+    try:
+        # Try to convert the answer directly to a number
+        score = int(answer.strip())
+        
+        # Ensure the score is between 0 and 100
+        return max(0, min(score, 100))
+    except (ValueError, TypeError):
+        logger.error(f"Failed to extract score from: {answer}")
+        return None
 
 async def fetch_file_from_github(repo_url: str, file_path: str) -> str:
     """Fetch the full content of a file from GitHub using the GitHub API."""
@@ -349,6 +360,62 @@ async def fetch_file_from_github(repo_url: str, file_path: str) -> str:
     except Exception as e:
         logger.error(f'Error fetching file from GitHub for {file_path}: {str(e)}')
         return ''
+
+@app.post('/begin-processing')
+async def begin_processing(request: BackgroundProcessRequest, background_tasks: BackgroundTasks):
+    """
+    Start the background processing of a repository.
+    Returns a processing ID that can be used to check the status.
+    """
+    processing_id = str(uuid.uuid4())
+    
+    # Store initial task data
+    processing_tasks[processing_id] = {
+        'status': 'submitted',
+        'repo_url': request.repo_url,
+        'description': request.description,
+        'challenge_name': request.challenge_name,
+        'folders': request.folders,
+        'created_at': datetime.now().isoformat(),
+        'estimatedTimeRemaining': 300  # Default 5 minutes estimate
+    }
+    
+    # Start the background processing task
+    background_tasks.add_task(
+        process_repo,
+        processing_id=processing_id,
+        repo_url=request.repo_url,
+        description=request.description,
+        challenge_name=request.challenge_name,
+        folders=request.folders
+    )
+    
+    return {
+        'processing_id': processing_id,
+        'status': 'submitted',
+        'estimatedTimeRemaining': 300  # Initial estimate of 5 minutes
+    }
+
+@app.get('/processing-status/{processing_id}')
+async def check_processing_status(processing_id: str):
+    """
+    Check the status of a processing task.
+    Returns the current status and any available results.
+    """
+    if processing_id not in processing_tasks:
+        raise HTTPException(status_code=404, detail=f"Processing task {processing_id} not found")
+    
+    task = processing_tasks[processing_id]
+    
+    # Clean up completed tasks older than 1 hour
+    current_time = time.time()
+    for task_id in list(processing_tasks.keys()):
+        task_data = processing_tasks[task_id]
+        if 'start_time' in task_data and (task_data['status'] == 'completed' or task_data['status'] == 'failed'):
+            if current_time - task_data.get('start_time', 0) > 3600:  # 1 hour
+                del processing_tasks[task_id]
+    
+    return task
 
 if __name__ == '__main__':
     import uvicorn
