@@ -102,18 +102,37 @@ async def clone_repo(repo_url: str, repo_dir: str) -> str:
 
 def get_code_files(repo_dir: str, folders: List[str]) -> List[str]:
     """Get list of code files from specified folders or entire repo."""
-    code_extensions = ('.py', '.tsx', '.jsx', '.ts', '.js')
+    code_extensions = ('.tsx', '.jsx', '.ts', '.js', '.rs', '.toml')
     code_files = []
     base_path = Path(repo_dir)
     search_paths = [base_path / folder for folder in folders] if folders else [base_path]
     
+    logger.info(f'Searching for code files in folders: {folders}')
+    logger.info(f'Base path: {base_path}')
+    
     for path in search_paths:
+        logger.info(f'Checking path: {path}')
         if not path.exists():
             logger.warning(f'Folder not found: {path}')
+            # Let's also check if the parent directory exists and list its contents
+            parent_path = path.parent
+            if parent_path.exists():
+                logger.info(f'Parent directory exists: {parent_path}')
+                try:
+                    parent_contents = list(parent_path.iterdir())
+                    logger.info(f'Parent directory contents: {[item.name for item in parent_contents]}')
+                except Exception as e:
+                    logger.error(f'Error listing parent directory contents: {e}')
             continue
+        logger.info(f'Folder exists: {path}')
+        files_found = 0
         for file_path in path.rglob('*'):
             if file_path.is_file() and file_path.suffix.lower() in code_extensions:
                 code_files.append(str(file_path))
+                files_found += 1
+        logger.info(f'Found {files_found} code files in {path}')
+    
+    logger.info(f'Total code files found: {len(code_files)}')
     return code_files
 
 def generate_embedding(code_content: str) -> np.ndarray:
@@ -166,8 +185,27 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
         # Clone the repository
         await clone_repo(repo_url, repo_dir)
         
+        # Let's check the repository structure
+        logger.info(f'Repository cloned to: {repo_dir}')
+        try:
+            repo_path = Path(repo_dir)
+            if repo_path.exists():
+                logger.info(f'Repository root contents: {[item.name for item in repo_path.iterdir()]}')
+                # Check if packages directory exists
+                packages_path = repo_path / 'packages'
+                if packages_path.exists():
+                    logger.info(f'Packages directory contents: {[item.name for item in packages_path.iterdir()]}')
+                    # Check cargo-stylus directory
+                    cargo_stylus_path = packages_path / 'cargo-stylus'
+                    if cargo_stylus_path.exists():
+                        logger.info(f'Cargo-stylus directory contents: {[item.name for item in cargo_stylus_path.iterdir()]}')
+        except Exception as e:
+            logger.error(f'Error checking repository structure: {e}')
+        
         # Get code files from specified folders or entire repo
+        logger.info(f'Processing folders: {folders}')
         code_files = get_code_files(repo_dir, folders)
+        logger.info(f'Total code files to process: {len(code_files)}')
         if not code_files:
             processing_tasks[processing_id]['status'] = 'failed'
             processing_tasks[processing_id]['error'] = 'No code files found in the specified folders or repository.'
@@ -204,8 +242,12 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
         
         # After embedding generation, query the code for review
         if success_count > 0:
+            # Check for caching implementation
+            caching_bonuses = check_caching_implementation(repo_dir)
+            caching_bonus = calculate_caching_bonus(caching_bonuses)
+            
             # Query codebase for evaluation
-            query_result = await query_codebase_for_evaluation(repo_url, description, challenge_name)
+            query_result = await query_codebase_for_evaluation(repo_url, description, challenge_name, caching_bonus)
             
             # Extract score from response
             score = extract_score_from_response(query_result.get('answer', ''))
@@ -215,6 +257,8 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
             processing_tasks[processing_id]['result'] = {
                 'answer': query_result.get('answer', ''),
                 'score': score,
+                'caching_bonus': caching_bonus,
+                'caching_details': caching_bonuses,
                 'relevant_files': query_result.get('relevant_files', [])
             }
         else:
@@ -230,7 +274,7 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
         processing_tasks[processing_id]['error'] = str(e)
         delete_repo(repo_dir)
 
-async def query_codebase_for_evaluation(repo_url: str, description: str, challenge_name: str) -> Dict:
+async def query_codebase_for_evaluation(repo_url: str, description: str, challenge_name: str, caching_bonus: int = 0) -> Dict:
     """Query the codebase using OpenAI with context from Pinecone embeddings."""
     try:
         # Generate embedding for the query
@@ -253,44 +297,47 @@ async def query_codebase_for_evaluation(repo_url: str, description: str, challen
             context.append(f'File: {file_path}\nContent:\n{full_content}\n')
         context_text = '\n\n'.join(context) if context else 'No relevant code snippets found.'
         
+        # Calculate the maximum base score to leave room for caching bonus
+        max_base_score = 100 - caching_bonus
+        
         # Prepare the prompt for OpenAI
-        prompt = f"""You are an objective code evaluator reviewing a student's submitted challenge. Based on the provided code context and the student's description of their changes, evaluate the code and return a single numeric score between 0-100.
+        prompt = f"""You are an objective code evaluator reviewing a student's submitted challenge. Based on the provided code context and the student's description of their changes, evaluate the code and return a single numeric score between 0-{max_base_score}.
 
 Your evaluation must consider these specific metrics with equal weight (25% each):
-1. Code quality (25 points): 
+1. Code quality (25% of {max_base_score} points): 
    - Clean, readable, and well-structured code
    - Proper variable/function naming
    - Appropriate comments and documentation
    - Modularity and organization
    - Avoidance of code duplication
 
-2. Security considerations (25 points):
+2. Security considerations (25% of {max_base_score} points):
    - Protection against common vulnerabilities (e.g., injection, XSS)
    - Proper input validation and sanitization
    - Secure authentication and authorization (if applicable)
    - Safe handling of sensitive data
    - Avoidance of security anti-patterns
 
-3. Uniqueness and creativity (25 points):
+3. Uniqueness and creativity (25% of {max_base_score} points):
    - Innovative approach to problem-solving
    - Creative implementation of features
    - Original thinking in design decisions
    - Efficiency of the solution
    - Going beyond basic requirements
 
-4. Adherence to best practices (25 points):
+4. Adherence to best practices (25% of {max_base_score} points):
    - Following language-specific conventions
    - Using appropriate design patterns
    - Implementing error handling correctly
    - Writing testable code
    - Performance considerations
 
-Code Context:
+Note: The system has detected caching implementation patterns worth {caching_bonus} bonus points. Your evaluation should focus on the remaining {max_base_score} points to ensure the total score (your evaluation + bonus) does not exceed 100.
 {context_text}
 
 Student's description of changes: {description}
 
-Your response must be ONLY a number between 0-100 representing the overall score. Do not include any explanations, comments, or additional text."""
+Your response must be ONL and STRICTLY a number between 0-{max_base_score} representing the base evaluation score. DO NOT INCLUDE ANY explanations, comments, or additional text."""
         
         # Call OpenAI API
         headers = {
@@ -300,28 +347,105 @@ Your response must be ONLY a number between 0-100 representing the overall score
         data = {
             'model': 'gpt-4o-mini',
             'messages': [
-                {'role': 'system', 'content': 'You are an objective code evaluator for student challenges. You must respond ONLY with a single number between 0-100 representing your score based on code quality, security, creativity, and best practices. Do not include any text, explanations, or comments in your response.'},
+                {'role': 'system', 'content': f'You are an objective code evaluator for student challenges. You must respond ONLY with a single number between 0-{max_base_score} representing your base evaluation score. The system will add {caching_bonus} bonus points for caching implementation, so your score + bonus should not exceed 100. Do not include any text, explanations, or comments in your response.'},
                 {'role': 'user', 'content': prompt}
             ],
         }
         response = requests.post('https://api.openai.com/v1/chat/completions', headers=headers, json=data)
         response.raise_for_status()
-        answer = response.json()['choices'][0]['message']['content']
+        base_answer = response.json()['choices'][0]['message']['content']
+        
+        # Add caching bonus to the base answer
+        if base_answer.isdigit():
+            final_score = int(base_answer) + caching_bonus
+            final_answer = f"{base_answer} + {caching_bonus} (caching bonus) = {final_score}"
+        else:
+            final_answer = base_answer
+            final_score = None
         
         return {
             'query': query,
-            'answer': answer,
+            'answer': final_answer,
             'relevant_files': [match['metadata']['file_path'] for match in query_result['matches']]
         }
     except Exception as e:
         logger.error(f'Error querying codebase: {str(e)}')
         return {'error': str(e)}
 
+def check_caching_implementation(repo_dir: str) -> Dict[str, bool]:
+    """Check for caching implementation patterns in the repository."""
+    caching_bonuses = {
+        'has_cache_import': False,
+        'has_cache_function': False,
+        'has_smartcache_toml': False
+    }
+    
+    try:
+        repo_path = Path(repo_dir)
+        logger.info(f'Repository path: {repo_path}')
+        
+        # Check for smartcache.toml at root level
+        smartcache_toml_path = repo_path / 'smartcache.toml'
+        logger.info(f'Smartcache.toml path: {smartcache_toml_path}')
+        if smartcache_toml_path.exists():
+            caching_bonuses['has_smartcache_toml'] = True
+            logger.info(f'Found smartcache.toml at root level')
+        
+        # Search for Rust files and check for caching patterns
+        for rust_file in repo_path.rglob('*.rs'):
+            try:
+                with open(rust_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                
+                # Check for cache import (flexible pattern matching)
+                if ('use stylus_cache_sdk::{is_contract_cacheable}' in content or 
+                    'use stylus_cache_sdk::is_contract_cacheable' in content or
+                    'use stylus_cache_sdk' in content and 'is_contract_cacheable' in content):
+                    caching_bonuses['has_cache_import'] = True
+                    logger.info(f'Found cache import in {rust_file}')
+                
+                # Check for cache function (flexible pattern matching)
+                if ('pub fn is_cacheable(&self) -> bool {' in content and 'is_contract_cacheable()' in content) or \
+                   ('fn is_cacheable(&self) -> bool {' in content and 'is_contract_cacheable()' in content) or \
+                   ('pub fn is_cacheable' in content and 'is_contract_cacheable()' in content):
+                    caching_bonuses['has_cache_function'] = True
+                    logger.info(f'Found cache function in {rust_file}')
+                    
+            except Exception as e:
+                logger.error(f'Error reading {rust_file}: {e}')
+        
+        logger.info(f'Caching implementation check results: {caching_bonuses}')
+        return caching_bonuses
+        
+    except Exception as e:
+        logger.error(f'Error checking caching implementation: {e}')
+        return caching_bonuses
+
+def calculate_caching_bonus(caching_bonuses: Dict[str, bool]) -> int:
+    """Calculate bonus points for caching implementation."""
+    bonus = 0
+    
+    if caching_bonuses['has_cache_import']:
+        bonus += 5
+    if caching_bonuses['has_cache_function']:
+        bonus += 10
+    if caching_bonuses['has_smartcache_toml']:
+        bonus += 5
+    
+    logger.info(f'Caching bonus calculated: {bonus} points')
+    return bonus
+
 def extract_score_from_response(answer: str) -> Optional[int]:
     """Extract a score from the model's response."""
     try:
-        # Try to convert the answer directly to a number
-        score = int(answer.strip())
+        # Handle combined score format like "75 + 15 (caching bonus) = 90"
+        if " + " in answer and " (caching bonus) = " in answer:
+            # Extract the final score after the equals sign
+            final_score = answer.split(" = ")[-1].strip()
+            score = int(final_score)
+        else:
+            # Try to convert the answer directly to a number
+            score = int(answer.strip())
         
         # Ensure the score is between 0 and 100
         return max(0, min(score, 100))
