@@ -18,6 +18,7 @@ import requests
 import uuid
 import time
 from datetime import datetime
+import re
 
 # Load environment variables
 load_dotenv()
@@ -87,13 +88,39 @@ class QueryRequest(BaseModel):
     query: str
     top_k: int = 2
 
-async def clone_repo(repo_url: str, repo_dir: str) -> str:
+def parse_github_repo_url(url: str):
+    """Parse a GitHub URL and return (base_repo_url, branch).
+
+    Supports formats like:
+    - https://github.com/owner/repo
+    - https://github.com/owner/repo.git
+    - https://github.com/owner/repo/tree/branch
+    """
+    try:
+        match = re.match(r'^https?://github\.com/([^/]+)/([^/]+)(?:/tree/([^/?#]+))?/?$', url.rstrip('/'))
+        if not match:
+            return url, None
+        owner = match.group(1)
+        repo = match.group(2).replace('.git', '')
+        branch = match.group(3)
+        base_repo_url = f'https://github.com/{owner}/{repo}'
+        return base_repo_url, branch
+    except Exception:
+        return url, None
+
+async def clone_repo(repo_url: str, repo_dir: str, branch: Optional[str] = None) -> str:
     """Clone the repository to a local directory."""
     try:
         if os.path.exists(repo_dir):
             logger.info(f'Repository directory {repo_dir} already exists, skipping clone.')
             return repo_dir
-        git.Repo.clone_from(repo_url, repo_dir)
+        # Normalize GitHub URL and infer branch from /tree/<branch> if present
+        normalized_url, parsed_branch = parse_github_repo_url(repo_url)
+        branch_to_clone = branch or parsed_branch
+        if branch_to_clone:
+            git.Repo.clone_from(normalized_url, repo_dir, branch=branch_to_clone)
+        else:
+            git.Repo.clone_from(normalized_url, repo_dir)
         logger.info(f'Successfully cloned repository to {repo_dir}')
         return repo_dir
     except Exception as e:
@@ -179,11 +206,14 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
         processing_tasks[processing_id]['status'] = 'processing'
         processing_tasks[processing_id]['start_time'] = time.time()
         
-        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        # Normalize URL and extract branch (if provided via /tree/<branch>)
+        normalized_repo_url, branch = parse_github_repo_url(repo_url)
+
+        repo_name = normalized_repo_url.split('/')[-1].replace('.git', '')
         repo_dir = f'repos/{repo_name}'
         
         # Clone the repository
-        await clone_repo(repo_url, repo_dir)
+        await clone_repo(normalized_repo_url, repo_dir, branch)
         
         # Let's check the repository structure
         logger.info(f'Repository cloned to: {repo_dir}')
@@ -221,7 +251,7 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
         
         for i in range(0, len(code_files), BATCH_SIZE):
             batch = code_files[i:i+BATCH_SIZE]
-            batch_tasks = [process_file(file_path, repo_url) for file_path in batch]
+            batch_tasks = [process_file(file_path, normalized_repo_url) for file_path in batch]
             batch_results = await asyncio.gather(*batch_tasks)
             results.extend(batch_results)
             
@@ -247,7 +277,13 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
             caching_bonus = calculate_caching_bonus(caching_bonuses)
             
             # Query codebase for evaluation
-            query_result = await query_codebase_for_evaluation(repo_url, description, challenge_name, caching_bonus)
+            query_result = await query_codebase_for_evaluation(
+                normalized_repo_url,
+                description,
+                challenge_name,
+                caching_bonus,
+                branch
+            )
             
             # Extract score from response
             score = extract_score_from_response(query_result.get('answer', ''))
@@ -274,7 +310,7 @@ async def process_repo(processing_id: str, repo_url: str, description: str, chal
         processing_tasks[processing_id]['error'] = str(e)
         delete_repo(repo_dir)
 
-async def query_codebase_for_evaluation(repo_url: str, description: str, challenge_name: str, caching_bonus: int = 0) -> Dict:
+async def query_codebase_for_evaluation(repo_url: str, description: str, challenge_name: str, caching_bonus: int = 0, branch: Optional[str] = None) -> Dict:
     """Query the codebase using OpenAI with context from Pinecone embeddings."""
     try:
         # Generate embedding for the query
@@ -293,7 +329,7 @@ async def query_codebase_for_evaluation(repo_url: str, description: str, challen
         context = []
         for match in query_result['matches']:
             file_path = match['metadata']['file_path']
-            full_content = await fetch_file_from_github(repo_url, file_path)
+            full_content = await fetch_file_from_github(repo_url, file_path, branch)
             context.append(f'File: {file_path}\nContent:\n{full_content}\n')
         context_text = '\n\n'.join(context) if context else 'No relevant code snippets found.'
         
@@ -453,7 +489,7 @@ def extract_score_from_response(answer: str) -> Optional[int]:
         logger.error(f"Failed to extract score from: {answer}")
         return None
 
-async def fetch_file_from_github(repo_url: str, file_path: str) -> str:
+async def fetch_file_from_github(repo_url: str, file_path: str, branch: Optional[str] = None) -> str:
     """Fetch the full content of a file from GitHub using the GitHub API."""
     try:
         # Extract owner and repo name from the URL
@@ -466,6 +502,8 @@ async def fetch_file_from_github(repo_url: str, file_path: str) -> str:
         
         # GitHub API URL for file content
         github_api_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{relative_path}'
+        if branch:
+            github_api_url += f'?ref={branch}'
         headers = {
             'Accept': 'application/vnd.github.v3.raw'
         }
